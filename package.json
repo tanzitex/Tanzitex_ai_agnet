@@ -1,8 +1,16 @@
 {
   "name": "tanzitex-ai-agent",
   "version": "1.0.0",
-  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
   "dependencies": {
+    "next": "^13.5.4",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
     "@supabase/supabase-js": "^2.39.0",
     "openai": "4.25.0"
   }
