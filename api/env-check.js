@@ -1,5 +1,5 @@
 // api/env-check.js
-module.exports = (req, res) => {
+export default (req, res) => {
   const needed = [
     'SUPABASE_URL',
     'SUPABASE_KEY',
