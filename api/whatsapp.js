@@ -1,56 +1,47 @@
-import { supabase } from "../utils/supabase.js";
-import OpenAI from "openai";
+// api/whatsapp.js
+// Debug wrapper for runtime error tracing.
+// Replace your existing file contents with this, commit, and push.
+
+import { supabase } from '../utils/supabase.js'; // keep path you already have
+// If utils/supabase.js uses `createClient` and throws, this will catch it below.
 
 export default async function handler(req, res) {
   try {
-    const body = req.body;
-
-    // WhatsApp incoming message
-    const userMessage = body?.message || "";
-
-    if (!userMessage) {
-      return res.json({ reply: "Invalid message received." });
+    // Basic method guard
+    if (req.method !== 'POST') {
+      return res.status(405).json({ ok: false, error: 'method_not_allowed' });
     }
 
-    // Load env variables
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    // Log incoming body (very helpful)
+    const body = req.body ?? {};
+    console.log('[whatsapp] incoming body:', JSON.stringify(body));
 
-    // Fetch product related answers using vector search
-    const { data: matches } = await supabase.rpc("match_products", {
-      query_text: userMessage,
-      match_threshold: 0.7,
-      match_count: 5
-    });
+    // Quick validation
+    if (!body.message) {
+      console.log('[whatsapp] missing message');
+      return res.status(400).json({ ok: false, error: 'missing_message' });
+    }
 
-    const productContext = matches
-      ?.map(
-        (p) =>
-          `Title: ${p.title}\nDescription: ${p.short_desc}\nPrice: ${p.price} ${p.currency}\nURL: ${p.url}`
-      )
-      .join("\n\n");
+    // Example: simple DB insert to confirm supabase works
+    // Ensure the table `inbox` exists. This insert is small and safe.
+    try {
+      const { error: dbError } = await supabase.from('inbox').insert([{ payload: body }]);
+      if (dbError) {
+        console.error('[whatsapp] supabase insert error:', dbError);
+        // do not crash — return a clear error
+        return res.status(500).json({ ok: false, error: 'supabase_insert_failed', details: dbError.message || dbError });
+      }
+      console.log('[whatsapp] supabase insert ok');
+    } catch (e) {
+      console.error('[whatsapp] supabase threw:', e.stack || e);
+      return res.status(500).json({ ok: false, error: 'supabase_exception', details: (e && e.message) || String(e) });
+    }
 
-    const systemPrompt = `
-You are TANZITEX AI SALES AGENT.
-You reply in friendly Hinglish.
-You SELL textile design bundles, memberships & courses.
-Always send clear CTA links.
-Push urgency & close sales fast.
-Product Info:\n${productContext}
-    `;
-
-    const aiResponse = await openai.chat.completions.create({
-      model: process.env.MODEL,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userMessage }
-      ]
-    });
-
-    const finalReply = aiResponse.choices[0].message.content;
-
-    return res.json({ reply: finalReply });
+    // Temporary echo reply (we won't call external WhatsApp provider here)
+    return res.json({ ok: true, echo: { message: body.message, from: body.from ?? null } });
   } catch (err) {
-    console.error(err);
-    return res.json({ reply: "System error. Try again later." });
+    console.error('[whatsapp] UNCAUGHT ERROR:', err.stack || err);
+    // Return generic 500 but include minimal message
+    return res.status(500).json({ ok: false, error: 'internal_server_error', message: (err && err.message) || String(err) });
   }
 }
