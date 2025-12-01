@@ -5,32 +5,21 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const AISENSY_API_KEY = process.env.AISENSY_API_KEY;
-const AISENSY_CAMPAIGN_ID = process.env.AISENSY_CAMPAIGN_ID; // auto_reply_fallback_api
+const AISENSY_CAMPAIGN_ID = process.env.AISENSY_CAMPAIGN_ID;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-
-// helper: now()
 const nowISOString = () => new Date().toISOString();
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
-
   try {
-    // ----------------------------
-    // 1) Verify webhook secret
-    // ----------------------------
-    // AiSensy may send token header or include token in body. Check both.
     const incomingToken = (req.headers['x-aisensy-token'] || req.headers['x-webhook-token'] || req.query.token || req.body?.token || '').toString();
     if (WEBHOOK_SECRET && incomingToken !== WEBHOOK_SECRET) {
-      console.warn('Webhook token mismatch', incomingToken);
+      console.warn('Webhook token mismatch', { incomingToken });
       return res.status(403).json({ ok: false, message: 'forbidden' });
     }
 
-    // ----------------------------
-    // 2) Parse inbound payload (adapt to AiSensy shape)
-    // ----------------------------
-    // AiSensy payloads vary. These lines try common paths.
     const payload = req.body || {};
     const data = payload.data || payload || {};
 
@@ -40,66 +29,67 @@ export default async function handler(req, res) {
     const timestamp = data?.timestamp || payload?.timestamp || nowISOString();
 
     if (!phone) {
-      console.error('No phone found in payload', payload);
+      console.error('No phone in payload', { payload });
       return res.status(400).json({ ok: false, message: 'invalid payload: no phone' });
     }
 
-    // ----------------------------
-    // 3) Idempotency: check message_id
-    // ----------------------------
-    const { data: existing } = await supabase
+    // idempotency: check existing message_id
+    const { data: existing, error: existingErr } = await supabase
       .from('inbox')
       .select('id')
       .eq('message_id', messageId)
       .limit(1)
       .maybeSingle();
 
+    if (existingErr) {
+      console.error('Supabase select error (idempotency)', existingErr);
+      // continue — we can still try to process, but be careful
+    }
     if (existing) {
-      // duplicate webhook call — ack and return
       return res.status(200).json({ ok: true, message: 'duplicate ignored' });
     }
 
-    // ----------------------------
-    // 4) Save inbound message
-    // ----------------------------
-    await supabase.from('inbox').insert([{
+    // Save inbound message
+    const inboundRow = {
       phone,
       message: messageText,
       message_id: messageId,
       direction: 'inbound',
       raw_payload: payload,
-      received_at: timestamp
-    }]);
+      received_at: timestamp,
+      created_at: nowISOString()
+    };
+    const { data: insertInboundData, error: insertInboundError } = await supabase.from('inbox').insert([inboundRow]).select().maybeSingle();
+    if (insertInboundError) {
+      console.error('Failed to insert inbound row', insertInboundError, { inboundRow });
+      // still ack webhook to avoid retries from AiSensy, but return error for logs
+      return res.status(500).json({ ok: false, error: 'db_inbound_insert_failed' });
+    }
 
-    // ----------------------------
-    // 5) Determine 24-hour window
-    // ----------------------------
-    // Find last inbound from this phone
-    const { data: lastMessage } = await supabase
+    // Determine 24h window: use last inbound message (excluding the one we just inserted)
+    const { data: lastMsgs, error: lastErr } = await supabase
       .from('inbox')
-      .select('received_at, direction')
+      .select('received_at,direction')
       .eq('phone', phone)
       .order('received_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+      .limit(2); // get last two to skip current inserted row
+    if (lastErr) console.error('supabase lastMsg error', lastErr);
 
     let within24h = false;
-    if (lastMessage && lastMessage.received_at) {
-      const lastTime = new Date(lastMessage.received_at).getTime();
-      const diffMs = Date.now() - lastTime;
-      within24h = diffMs <= 24 * 60 * 60 * 1000;
+    if (Array.isArray(lastMsgs) && lastMsgs.length > 1) {
+      // second item is previous message
+      const prev = lastMsgs[1];
+      if (prev && prev.received_at) {
+        const diffMs = Date.now() - new Date(prev.received_at).getTime();
+        within24h = diffMs <= 24 * 60 * 60 * 1000;
+      }
     } else {
-      // no prior message -> treat as outside 24h
       within24h = false;
     }
 
-    // ----------------------------
-    // 6) Generate reply
-    // ----------------------------
+    // Generate reply
     let replyText = 'Thanks — we received your message. We will reply soon.';
-
     if (within24h) {
-      // Call OpenAI for a contextual reply
       try {
         const openaiResp = await fetch('https://api.openai.com/v1/chat/completions', {
           method: 'POST',
@@ -108,9 +98,9 @@ export default async function handler(req, res) {
             'Content-Type': 'application/json'
           },
           body: JSON.stringify({
-            model: 'gpt-4o-mini', // change if you prefer another model
+            model: 'gpt-4o-mini',
             messages: [
-              { role: 'system', content: 'You are a concise WhatsApp assistant. Reply in short Hinglish if user message is in Hinglish, otherwise short and helpful.' },
+              { role: 'system', content: 'You are a concise WhatsApp assistant. Reply in short Hinglish if user uses Hinglish.' },
               { role: 'user', content: `Incoming message: ${messageText}` }
             ],
             max_tokens: 200,
@@ -120,34 +110,31 @@ export default async function handler(req, res) {
         const openaiJson = await openaiResp.json();
         replyText = openaiJson?.choices?.[0]?.message?.content?.trim() || replyText;
       } catch (err) {
-        console.error('OpenAI error', err);
-        replyText = 'Sorry, temporary error generating reply. We will get back soon.';
+        console.error('OpenAI call failed', err);
+        replyText = 'Sorry, temporary error generating reply.';
       }
     } else {
-      // outside 24h — we will use the approved template below; replyText used as template param
-      replyText = `Hi, thanks for messaging. We will reply soon.`; // fallback param value
+      // fallback param
+      replyText = `Hi, thanks for messaging. We'll reply soon.`;
     }
 
-    // ----------------------------
-    // 7) Save outbound row (pending)
-    // ----------------------------
+    // Insert outbound row (pending)
     const outboundInsert = {
       phone,
       message: replyText,
       direction: 'outbound',
-      message_id: null,
+      status: 'pending',
       raw_payload: null,
       sent_at: null,
-      status: 'pending',
       created_at: nowISOString()
     };
-    const { data: outRow } = await supabase.from('inbox').insert([outboundInsert]).select().single();
+    const { data: outData, error: outErr } = await supabase.from('inbox').insert([outboundInsert]).select().maybeSingle();
+    if (outErr || !outData) {
+      console.error('Failed to insert outbound row', outErr, { outboundInsert, outData });
+      // we attempted to create outbound row but it failed — still try to send, but record will be missing
+    }
 
-    // ----------------------------
-    // 8) Send via AiSensy
-    // If within 24h -> freeform text
-    // If outside 24h -> send template params (use AISENSY_CAMPAIGN_ID that points to fallback template)
-    // ----------------------------
+    // Send via AiSensy
     try {
       const aisensyEndpoint = 'https://backend.aisensy.com/campaign/t1/api/v2';
       let aisBody = {
@@ -155,48 +142,51 @@ export default async function handler(req, res) {
         campaignName: AISENSY_CAMPAIGN_ID,
         destination: phone
       };
-
-      if (within24h) {
-        aisBody.message = replyText; // freeform (check AiSensy docs if field name differs)
-      } else {
-        // send template - use templateParams array with appropriate param count
-        // We'll pass replyText as first param (if your template accepts 1 param)
-        aisBody.templateName = 'auto_reply_fallback'; // ensure this matches your template name in AiSensy
-        aisBody.templateParams = [ replyText ];
+      if (within24h) aisBody.message = replyText;
+      else {
+        aisBody.templateName = 'auto_reply_fallback';
+        aisBody.templateParams = [replyText];
       }
-
       const aisResp = await fetch(aisensyEndpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(aisBody)
       });
-
       const aisJson = await aisResp.json();
 
-      // update outbound row status
-      await supabase.from('inbox').update({
-        status: aisJson?.status || 'sent',
-        sent_at: nowISOString(),
-        raw_payload: aisJson,
-        message_id: aisJson?.messageId || aisJson?.data?.message_id || outRow?.id
-      }).eq('id', outRow.id);
-
+      // update outbound row if present
+      if (outData && outData.id) {
+        const upd = {
+          status: aisJson?.status || 'sent',
+          sent_at: nowISOString(),
+          raw_payload: aisJson,
+          message_id: aisJson?.messageId || aisJson?.data?.message_id || null
+        };
+        const { error: updErr } = await supabase.from('inbox').update(upd).eq('id', outData.id);
+        if (updErr) console.error('Failed to update outbound row', updErr, { upd, outId: outData.id });
+      } else {
+        // no outData id — create a minimal log row
+        await supabase.from('inbox').insert([{
+          phone,
+          message: replyText,
+          direction: 'outbound',
+          status: aisJson?.status || 'sent',
+          raw_payload: aisJson,
+          sent_at: nowISOString(),
+          created_at: nowISOString()
+        }]).catch(e => console.error('fallback log insert failed', e));
+      }
     } catch (err) {
       console.error('AiSensy send error', err);
-      // mark outbound failed
-      await supabase.from('inbox').update({
-        status: 'failed',
-        sent_at: nowISOString(),
-        raw_payload: { error: String(err) }
-      }).eq('id', outRow.id);
+      if (outData && outData.id) {
+        await supabase.from('inbox').update({ status: 'failed', raw_payload: { error: String(err) }, sent_at: nowISOString() }).eq('id', outData.id);
+      }
     }
 
-    // ----------------------------
-    // 9) Acknowledge webhook to AiSensy immediately
-    // ----------------------------
+    // ack webhook
     return res.status(200).json({ ok: true });
   } catch (err) {
-    console.error('Webhook handler error', err);
+    console.error('Webhook handler fatal error', err);
     return res.status(500).json({ ok: false, error: String(err) });
   }
 }
